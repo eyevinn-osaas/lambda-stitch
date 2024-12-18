@@ -3,7 +3,7 @@ const fetch = require("node-fetch");
 
 exports.handler = async (event) => {
   let response;
-  let prefix = '/stitch';
+  let prefix = "/stitch";
   if (process.env.PREFIX) {
     prefix = process.env.PREFIX;
   }
@@ -23,8 +23,8 @@ exports.handler = async (event) => {
   } else if (event.path === "/" && event.httpMethod === "GET") {
     response = {
       statusCode: 200,
-      body: "OK"
-    }
+      body: "OK",
+    };
   } else {
     response = generateErrorResponse({ code: 404 });
   }
@@ -106,7 +106,7 @@ const handleOptionsRequest = async () => {
 };
 
 const handleCreateRequest = async (event) => {
-  const prefix = process.env.PREFIX ? process.env.PREFIX : '/stitch';
+  const prefix = process.env.PREFIX ? process.env.PREFIX : "/stitch";
   try {
     if (!event.body) {
       return generateErrorResponse({ code: 400, message: "Missing request body" });
@@ -194,10 +194,12 @@ const handleMasterManifestRequest = async (event) => {
     } else {
       const useInterstitial = event.queryStringParameters.i && event.queryStringParameters.i === "1";
       const combineInterstitial = event.queryStringParameters.c && event.queryStringParameters.c === "1";
+      const nosubs = event.queryStringParameters.f && event.queryStringParameters.f === "nosubtitles";
       const manifest = await getMasterManifest(encodedPayload);
       const rewrittenManifest = await rewriteMasterManifest(manifest, encodedPayload, {
         useInterstitial,
         combineInterstitial,
+        nosubs
       });
       return generateManifestResponse(rewrittenManifest);
     }
@@ -244,7 +246,18 @@ const rewriteMasterManifest = async (manifest, encodedPayload, opts) => {
   let grouplang = null;
   let trackname = null;
   for (let i = 0; i < lines.length; i++) {
-    const l = lines[i];
+    let l = lines[i];
+    if (opts && opts.nosubs) {
+      if (l.includes("#EXT-X-MEDIA") && l.includes("TYPE=SUBTITLES")) {
+        continue;
+      }
+      if(l.includes("#EXT-X-STREAM-INF") && l.includes("SUBTITLES")) {
+        let splitLines = l.split(",");
+        let withoutSubs = splitLines.filter((s) => !s.includes("SUBTITLES"));
+        l = withoutSubs.join(",");
+      }
+    }
+
     if (l.includes("#EXT-X-MEDIA") && l.includes("TYPE=AUDIO") && l.includes("GROUP-ID")) {
       let subdir = "";
       let splitLines = l.split(",");
@@ -336,36 +349,116 @@ const createVodFromPayload = async (encodedPayload, opts) => {
   const hlsVod = new HLSSpliceVod(uri, vodOpts);
   await hlsVod.load();
   adpromises = [];
-  let id = payload.breaks.length + 1;
-  for (let i = 0; i < payload.breaks.length; i++) {
-    const b = payload.breaks[i];
-    if (opts && (opts.useInterstitial || opts.combineInterstitial)) {
-      const assetListPayload = {
-        assets: [{ uri: b.url, dur: b.duration / 1000 }],
-      };
-      const encodedAssetListPayload = encodeURIComponent(serialize(assetListPayload));
-      const baseUrl = process.env.ASSET_LIST_BASE_URL || "";
-      const assetListUrl = new URL(baseUrl + `/stitch/assetlist/${encodedAssetListPayload}`);
-      let interstitialOpts = {
-        plannedDuration: b.duration,
-        resumeOffset: 0,
-      };
-      if (b.pol !== undefined || b.ro !== undefined || opts.combineInterstitial) {
-        if (b.pol !== undefined) {
-          interstitialOpts.playoutLimit = b.pol;
+
+  if (opts && (opts.useInterstitial || opts.combineInterstitial)) {
+    const assetListPayload = {
+      assets: [],
+    };
+    const GroupBreaks = (breaks) => {
+      let groupedBreaks = {};
+      breaks.forEach((b) => {
+        if (!groupedBreaks[b.pos]) {
+          groupedBreaks[b.pos] = [];
         }
-        if (b.ro !== undefined) {
-          interstitialOpts.resumeOffset = b.ro;
-        }
-      }
-      if (opts.combineInterstitial) {
-        adpromises.push(() => hlsVod.insertInterstitialAt(b.pos, `${--id}`, assetListUrl.href, true, interstitialOpts));
-        adpromises.push(() => hlsVod.insertAdAt(b.pos, b.url));
-        interstitialOpts.resumeOffset = b.duration;
-      } else {
-        adpromises.push(() => hlsVod.insertInterstitialAt(b.pos, `${--id}`, assetListUrl.href, true, interstitialOpts));
-      }
+        groupedBreaks[b.pos].push(b);
+      });
+      return groupedBreaks;
+    };
+    // check if any breaks have a 'assetListUrl' property
+    // if so, then filter out all breakItems that have 'assetListUrl' property
+    let payloadBreaksToUse;
+    const breaksWithAssetList = payload.breaks.filter(b => b.assetListUrl !== undefined);
+    if (breaksWithAssetList.length > 0) {
+      payloadBreaksToUse = breaksWithAssetList;
     } else {
+      payloadBreaksToUse = payload.breaks;
+    }
+    const breakGroupsDict = GroupBreaks(payloadBreaksToUse);
+    let previousBreakDuration = 0;
+    let _id = Object.keys(breakGroupsDict).length + 1;
+    for (let bidx = 0; bidx < Object.keys(breakGroupsDict).length; bidx++) {
+      assetListPayload.assets = []; // Reset Asset List Payload
+      let breakPosition = Object.keys(breakGroupsDict)[bidx];
+      const breakGroup = breakGroupsDict[breakPosition];
+      let breakDur = 0;
+      let interstitialOpts = {
+        resumeOffset: 0,
+        addDeltaOffset: opts && opts.combineInterstitial ? true : false,
+      };
+      let ASSET_LIST_URL;
+      let insertAtListPromises = [];
+      // For every ad with the same position
+      for (let ad of breakGroup) {
+        // Get All HLS Interstitial options
+        if (ad.pol !== undefined) {
+          interstitialOpts.playoutLimit = ad.pol;
+        }
+        if (ad.cue !== undefined) {
+          interstitialOpts.cue = ad.cue;
+        }
+        if (ad.sn !== undefined) {
+          interstitialOpts.snap = ad.sn;
+        }
+        if (ad.ro !== undefined) {
+          interstitialOpts.resumeOffset = ad.ro;
+        }
+        if (ad.ro !== undefined) {
+          interstitialOpts.resumeOffset = ad.ro;
+        }
+        if (ad.re !== undefined) {
+          interstitialOpts.restrict = ad.re;
+        }
+        if (ad.cmv !== undefined) {
+          interstitialOpts.contentmayvary = ad.cmv;
+        }
+        if (ad.tlo !== undefined) {
+          interstitialOpts.timelineoccupies = ad.tlo;
+        }
+        if (ad.tls !== undefined) {
+          interstitialOpts.timelinestyle = ad.tls;
+        }
+        if (ad.cb !== undefined) {
+          interstitialOpts.custombeacon = ad.cb;
+        }
+        // Check if the ad has an assetListUrl
+        if (ad.assetListUrl !== undefined) {
+          if (ad.duration !== undefined) {
+            interstitialOpts.plannedDuration = ad.duration;
+          }
+        } else {
+          // Create the Asset List Stitcher Payload
+          const assetItem = {
+            uri: ad.url,
+            dur: ad.duration / 1000,
+          };
+          breakDur += ad.duration;
+          assetListPayload.assets.push(assetItem);
+          if (opts.combineInterstitial != undefined) {
+            insertAtListPromises.push(() => hlsVod.insertAdAt(ad.pos, ad.url));
+            interstitialOpts.resumeOffset = breakDur;
+          }
+        }
+      }
+      // Set the Asset List URL
+      if (breaksWithAssetList.length > 0) {
+        ASSET_LIST_URL = new URL(breakGroup[0].assetListUrl);
+      } else {
+        interstitialOpts.plannedDuration = breakDur;
+        const encodedAssetListPayload = encodeURIComponent(serialize(assetListPayload));
+        const baseUrl = process.env.ASSET_LIST_BASE_URL || "";
+        ASSET_LIST_URL = new URL(baseUrl + `/stitch/assetlist/${encodedAssetListPayload}`);
+      }
+      // Create Promise to insert Interstitial at Break Position
+      interstitialOpts.previousBreakDuration = previousBreakDuration;
+      adpromises.push(() => hlsVod.insertInterstitialAt(breakPosition, `Ad-Break-${--_id}.${Date.now()}`, ASSET_LIST_URL.href, true, interstitialOpts));
+      insertAtListPromises.forEach(i => {
+        adpromises.push(i);
+      })
+      previousBreakDuration = breakDur;
+    }
+  } else {
+    for (let i = 0; i < payload.breaks.length; i++) {
+      const b = payload.breaks[i];
       adpromises.push(() => hlsVod.insertAdAt(b.pos, b.url));
     }
   }
